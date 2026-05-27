@@ -15,10 +15,10 @@ three layers that prevent hallucinated bookings.
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Literal
+from typing import Iterable, Literal
 from zoneinfo import ZoneInfo
 
-from wispoke_voice.tenant.models import TenantConfig
+from wispoke_voice.tenant.models import TenantConfig, WeeklyScheduleSlot
 
 
 Language = Literal["en", "da"]
@@ -61,6 +61,80 @@ bookingen. Hvis de vil tale med en person, kald `request_human_handoff`.
 """
 
 
+# 0 = Sunday in our DB (matches Postgres convention chosen in migration 004).
+_DAY_NAMES_EN = ("Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday")
+_DAY_NAMES_DA = ("søndag", "mandag", "tirsdag", "onsdag", "torsdag", "fredag", "lørdag")
+
+
+def _hhmm(time_str: str) -> str:
+    """Coerce a Postgres TIME (`HH:MM:SS` or `HH:MM`) into spoken-friendly `H:MM`/`H` form."""
+    parts = time_str.split(":")
+    try:
+        h, m = int(parts[0]), int(parts[1])
+    except (ValueError, IndexError):
+        return time_str
+    if m == 0:
+        return f"{h}:00"
+    return f"{h}:{m:02d}"
+
+
+def _is_full_day(slot: WeeklyScheduleSlot) -> bool:
+    """A slot spanning ~00:00 to ~24:00 counts as a full day. We allow some
+    slack (23:59 / 23:59:59) because the DB CHECK constraint forbids 24:00."""
+    starts_at_zero = slot.start_time.startswith("00:00")
+    ends_at_eod = slot.end_time.startswith(("23:59", "24:00"))
+    return starts_at_zero and ends_at_eod
+
+
+def format_business_hours(slots: Iterable[WeeklyScheduleSlot], language: Literal["en", "da"]) -> str:
+    """Render the weekly schedule as a single short sentence the LLM can read.
+
+    Raw schedule arrays are LLM-hostile: the model wastes tokens parsing them
+    and sometimes hallucinates wrong hours. Pre-formatting once at session
+    start eliminates both problems and saves ~30-50 tokens per turn.
+
+    Three cases produce three styles:
+      • All 7 days fully open       → "open 24/7"
+      • All days same window        → "open daily 9 AM to 5 PM"
+      • Mixed                       → "open Mon-Fri 9 AM to 5 PM, Sat 10-2; closed Sun"
+    """
+    active = [s for s in slots if s.is_active]
+    if not active:
+        return "no business hours configured" if language == "en" else "ingen åbningstider konfigureret"
+
+    # Group by (start, end) so identical windows collapse.
+    days_by_window: dict[tuple[str, str], list[int]] = {}
+    for s in active:
+        key = (s.start_time, s.end_time)
+        days_by_window.setdefault(key, []).append(s.day_of_week)
+
+    full_day_days = {dow for s in active if _is_full_day(s) for dow in [s.day_of_week]}
+
+    # Case 1: 24/7 — all 7 days, all full-day.
+    if len(full_day_days) == 7:
+        return "open 24/7 (any time of day)" if language == "en" else "åben døgnet rundt"
+
+    day_names = _DAY_NAMES_DA if language == "da" else _DAY_NAMES_EN
+    parts: list[str] = []
+    for (start, end), days in days_by_window.items():
+        days_sorted = sorted(days)
+        # Render day list as "Mon-Fri" if contiguous, otherwise "Mon, Wed, Fri".
+        if len(days_sorted) > 1 and days_sorted == list(range(days_sorted[0], days_sorted[-1] + 1)):
+            day_label = f"{day_names[days_sorted[0]]}-{day_names[days_sorted[-1]]}"
+        else:
+            day_label = ", ".join(day_names[d] for d in days_sorted)
+        window = f"{_hhmm(start)} to {_hhmm(end)}" if language == "en" else f"{_hhmm(start)} til {_hhmm(end)}"
+        parts.append(f"{day_label} {window}")
+
+    closed_days = [day_names[d] for d in range(7) if d not in {dow for dows in days_by_window.values() for dow in dows}]
+    closed_clause = ""
+    if closed_days:
+        closed_clause = f"; closed {', '.join(closed_days)}" if language == "en" else f"; lukket {', '.join(closed_days)}"
+
+    prefix = "open " if language == "en" else "åben "
+    return prefix + "; ".join(parts) + closed_clause
+
+
 def _today_in_tenant_tz(tenant: TenantConfig) -> str:
     """Today's date in YYYY-MM-DD in the tenant's local timezone.
 
@@ -79,6 +153,7 @@ def build_system_prompt(tenant: TenantConfig) -> str:
     """Compose the final system prompt from base rules + tenant context."""
     rules = _BASE_RULES_DA if tenant.language == "da" else _BASE_RULES_EN
     today = _today_in_tenant_tz(tenant)
+    hours = format_business_hours(tenant.weekly_schedule, tenant.language)
 
     if tenant.language == "da":
         identity = (
@@ -86,7 +161,8 @@ def build_system_prompt(tenant: TenantConfig) -> str:
             + (f" — en {tenant.business_type}." if tenant.business_type else ".")
         )
         booking_ctx = (
-            f"I dag er {today} (tenantens tidszone: {tenant.timezone}). "
+            f"I dag er {today} (tidszone: {tenant.timezone}). "
+            f"Forretningen er {hours}. "
             f"Når kunden siger 'i morgen', 'næste tirsdag' osv., omsæt det "
             f"til en ISO-dato (YYYY-MM-DD) ud fra denne dato. "
             f"Standardvarigheden for en aftale er {tenant.appointment_duration_min} minutter."
@@ -97,7 +173,8 @@ def build_system_prompt(tenant: TenantConfig) -> str:
             + (f" — a {tenant.business_type}." if tenant.business_type else ".")
         )
         booking_ctx = (
-            f"Today is {today} (tenant timezone: {tenant.timezone}). "
+            f"Today is {today} (timezone: {tenant.timezone}). "
+            f"The business is {hours}. "
             f"When the caller says 'tomorrow', 'next Tuesday', etc., convert "
             f"it to an ISO date (YYYY-MM-DD) relative to today. NEVER use a "
             f"date from your training data — always compute from today. "

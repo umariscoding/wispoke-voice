@@ -22,7 +22,7 @@ from livekit.agents import Agent, RunContext, function_tool
 from wispoke_voice.agent.state_machine import BookingState, StateMachine
 from wispoke_voice.api_client import WispokeApiClient, WispokeApiError
 from wispoke_voice.observability import LatencyTimer
-from wispoke_voice.prompts import build_system_prompt, read_back_slot
+from wispoke_voice.prompts import GREETING_FALLBACKS, build_system_prompt, read_back_slot
 from wispoke_voice.tenant.models import BookingDraft, Slot, TenantConfig
 
 
@@ -37,6 +37,49 @@ _PHONE_STRIP = re.compile(r"[\s\-\(\)\.]")
 
 def _normalize_phone(raw: str) -> str:
     return _PHONE_STRIP.sub("", raw)
+
+
+# Filler phrases spoken while a tool runs. Without these, the caller hears
+# 1-2s of dead air during DB / LLM round-trips and starts to talk over the
+# agent. Production voice platforms (Retell, Vapi) treat these as mandatory.
+# Pick one randomly per call to avoid the "robot says the same thing every
+# time" feel.
+_FILLER_PHRASES = {
+    "en": (
+        "Let me check that for you.",
+        "One moment please.",
+        "Just a second.",
+        "Let me pull that up.",
+    ),
+    "da": (
+        "Lad mig lige tjekke det.",
+        "Et øjeblik, tak.",
+        "Lige et sekund.",
+        "Jeg finder det lige frem.",
+    ),
+}
+
+
+def _pick_filler(language: str) -> str:
+    """Cheap deterministic-ish pick — `random` is plenty for this."""
+    import random
+
+    phrases = _FILLER_PHRASES.get(language, _FILLER_PHRASES["en"])
+    return random.choice(phrases)
+
+
+async def _speak_filler(ctx: RunContext, language: str) -> None:
+    """Fire the filler phrase BEFORE the slow work starts.
+
+    `session.say()` returns once the TTS is scheduled — the actual playback
+    runs concurrently with whatever we do next. So the caller hears
+    "Let me check..." while the API/LLM call is in flight, masking 200-1500ms
+    of latency. Non-fatal: if scheduling the speech fails, we just proceed.
+    """
+    try:
+        await ctx.session.say(_pick_filler(language), allow_interruptions=True)
+    except Exception:
+        logger.debug("filler phrase scheduling failed (non-fatal)", exc_info=True)
 
 
 class BookingAgent(Agent):
@@ -73,6 +116,25 @@ class BookingAgent(Agent):
     @property
     def timer(self) -> LatencyTimer:
         return self._timer
+
+    # ─── Lifecycle ─────────────────────────────────────────────────────────
+
+    async def on_enter(self) -> None:
+        """Fired by the framework the moment the agent joins the session.
+
+        This is the canonical LiveKit greeting hook. We `say()` the configured
+        greeting WITHOUT awaiting the SpeechHandle — that schedules the speech
+        and returns immediately, so a slow/stalled TTS connection can never
+        block the session. `allow_interruptions=True` means even if the
+        greeting hangs mid-playout, the caller's speech still breaks through
+        and the agent stays responsive. (A previous version awaited the speech
+        with interruptions disabled, which could lock the session in a
+        permanent "agent speaking" state if TTS stalled.)
+        """
+        greeting = self._tenant.greeting_message or GREETING_FALLBACKS.get(
+            self._tenant.language, GREETING_FALLBACKS["en"]
+        )
+        self.session.say(greeting, allow_interruptions=True)
 
     # ─── Tools (the LLM-callable surface) ──────────────────────────────────
     #
@@ -141,6 +203,11 @@ class BookingAgent(Agent):
                 date_from,
                 extra={"company_id": self._tenant.company_id, "date_to": date_to},
             )
+
+        # Speak a filler BEFORE the API call so the caller hears the agent
+        # "thinking" instead of dead air. The TTS playback runs concurrently
+        # with the API request.
+        await _speak_filler(ctx, self._tenant.language)
 
         with self._timer.span("tool.get_available_slots"):
             try:
@@ -251,6 +318,10 @@ class BookingAgent(Agent):
 
         slot = self._draft.selected_slot
         assert slot is not None  # is_ready_to_book guarantees this
+
+        # Filler — booking write is the slowest tool (~1s for DB insert +
+        # conflict check). Speaking while we work hides almost all of it.
+        await _speak_filler(ctx, self._tenant.language)
 
         with self._timer.span("tool.create_booking"):
             try:

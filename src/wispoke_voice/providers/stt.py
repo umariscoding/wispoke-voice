@@ -37,9 +37,11 @@ def make_stt(tenant: TenantConfig):
             language=tenant.language,
             smart_format=True,
             interim_results=True,
-            # Tune utterance_end_ms loosely for Danish — overly aggressive
-            # endpointing cuts off elided endings.
-            endpointing_ms=600,
+            # 300ms balances snappy turn-taking against cutting people off.
+            # The semantic turn detector (MultilingualModel) is the real
+            # end-of-turn authority; this is just the STT-level floor. Danish
+            # has elided endings so we don't go lower than 300.
+            endpointing_ms=300,
             api_key=cfg.deepgram_api_key,
         )
 

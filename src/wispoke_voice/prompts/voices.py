@@ -1,90 +1,78 @@
 """
-Curated ElevenLabs voice catalog.
+Curated TTS voice catalogs, keyed by provider.
 
-These are vetted Flash v2.5-compatible voices from ElevenLabs' current default
-"premade" set — confirmed available on free + paid tiers. The dashboard picker
-shows this list to tenants; the worker reads from the same catalog so a
-voice_id stored in `voice_agent_settings.voice_model` is guaranteed to exist.
+The dashboard picker shows these lists to tenants; the worker reads from the
+same catalogs so a voice stored in `voice_agent_settings.voice_model` resolves
+to the right provider. A voice not found for its provider falls back to that
+provider's default (never another provider's voice — passing a Deepgram model
+name to OpenAI, or vice versa, errors).
 
-ElevenLabs refreshes their premade set periodically. When that happens:
-  1. Hit `GET https://api.elevenlabs.io/v1/voices` with any account API key
-  2. Filter for `category == "premade"` voices that work on the free tier
-  3. Update this catalog AND the matching list in
-     `wispoke-admin/src/components/voice-agent/VoiceModelPicker.tsx`
-
-The two lists MUST stay in lockstep — the worker falls back to the first
-entry here if the stored voice_id isn't found, which would silently override
-a tenant's saved selection if the lists drift apart.
+Keep these lists identical to
+`wispoke-admin/src/components/voice-agent/VoiceModelPicker.tsx`.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal, Tuple
+from typing import Dict, Literal, Optional, Tuple
+
+
+TtsProvider = Literal["deepgram", "openai", "elevenlabs", "azure"]
 
 
 @dataclass(frozen=True)
 class VoiceOption:
-    voice_id: str  # ElevenLabs voice_id
+    voice_id: str  # provider-specific id (Aura model name / OpenAI voice name)
     name: str  # display label
     gender: Literal["Male", "Female", "Neutral"]
-    accent: str  # rough description for the picker tooltip
+    accent: str  # short description for the picker tooltip
     languages: Tuple[str, ...]  # ISO 639-1 codes the voice handles well
 
 
-# Order matters — the first entry is the default for new tenants.
-# All these voices are part of ElevenLabs' current premade catalog and
-# Flash v2.5 supports multilingual generation including Danish.
-CURATED_VOICES: Tuple[VoiceOption, ...] = (
-    VoiceOption(
-        voice_id="EXAVITQu4vr4xnSDxMaL",
-        name="Sarah",
-        gender="Female",
-        accent="Mature, Reassuring, Confident",
-        languages=("en", "da"),
-    ),
-    VoiceOption(
-        voice_id="FGY2WhTYpPnrIDTdsKH5",
-        name="Laura",
-        gender="Female",
-        accent="Enthusiast, Quirky Attitude",
-        languages=("en", "da"),
-    ),
-    VoiceOption(
-        voice_id="SAz9YHcvj6GT2YYXdXww",
-        name="River",
-        gender="Neutral",
-        accent="Relaxed, Neutral, Informative",
-        languages=("en", "da"),
-    ),
-    VoiceOption(
-        voice_id="JBFqnCBsd6RMkjVDRZzb",
-        name="George",
-        gender="Male",
-        accent="Warm, Captivating Storyteller",
-        languages=("en", "da"),
-    ),
-    VoiceOption(
-        voice_id="IKne3meq5aSn9XLyUdCD",
-        name="Charlie",
-        gender="Male",
-        accent="Deep, Confident, Energetic",
-        languages=("en", "da"),
-    ),
-    VoiceOption(
-        voice_id="CwhRBWXzGAHq8TQ4Fs17",
-        name="Roger",
-        gender="Male",
-        accent="Laid-Back, Casual, Resonant",
-        languages=("en", "da"),
-    ),
+# Deepgram Aura-2 — purpose-built for real-time voice agents (low TTFB,
+# streaming). English-only. Order matters: first entry is the provider default.
+_DEEPGRAM_VOICES: Tuple[VoiceOption, ...] = (
+    VoiceOption("aura-2-thalia-en", "Thalia", "Female", "Clear, friendly", ("en",)),
+    VoiceOption("aura-2-andromeda-en", "Andromeda", "Female", "Warm, casual", ("en",)),
+    VoiceOption("aura-2-helena-en", "Helena", "Female", "Calm, professional", ("en",)),
+    VoiceOption("aura-2-apollo-en", "Apollo", "Male", "Confident, friendly", ("en",)),
+    VoiceOption("aura-2-arcas-en", "Arcas", "Male", "Natural, smooth", ("en",)),
+    VoiceOption("aura-2-orion-en", "Orion", "Male", "Deep, approachable", ("en",)),
 )
 
-DEFAULT_VOICE_ID = CURATED_VOICES[0].voice_id
+# OpenAI gpt-4o-mini-tts — speaks any language but English-tuned (Danish is
+# mildly English-accented). Higher TTFB than Aura-2 from most regions.
+_OPENAI_VOICES: Tuple[VoiceOption, ...] = (
+    VoiceOption("alloy", "Alloy", "Neutral", "Balanced, professional", ("en", "da")),
+    VoiceOption("nova", "Nova", "Female", "Warm, friendly", ("en", "da")),
+    VoiceOption("shimmer", "Shimmer", "Female", "Gentle, calm", ("en", "da")),
+    VoiceOption("coral", "Coral", "Female", "Bright, upbeat", ("en", "da")),
+    VoiceOption("ash", "Ash", "Male", "Clear, confident", ("en", "da")),
+    VoiceOption("onyx", "Onyx", "Male", "Deep, authoritative", ("en", "da")),
+)
+
+VOICES_BY_PROVIDER: Dict[str, Tuple[VoiceOption, ...]] = {
+    "deepgram": _DEEPGRAM_VOICES,
+    "openai": _OPENAI_VOICES,
+}
+
+DEFAULT_VOICE_BY_PROVIDER: Dict[str, str] = {
+    "deepgram": _DEEPGRAM_VOICES[0].voice_id,  # "aura-2-thalia-en"
+    "openai": _OPENAI_VOICES[0].voice_id,  # "alloy"
+}
+
+# Global fallback used when a provider has no catalog wired (elevenlabs/azure).
+DEFAULT_VOICE_ID = DEFAULT_VOICE_BY_PROVIDER["deepgram"]
 
 
-def get_voice(voice_id: str) -> VoiceOption | None:
-    for v in CURATED_VOICES:
+def get_voice(voice_id: str, provider: str) -> Optional[VoiceOption]:
+    """Look up a voice within a specific provider's catalog only."""
+    for v in VOICES_BY_PROVIDER.get(provider, ()):  # unknown provider → no match
         if v.voice_id == voice_id:
             return v
     return None
+
+
+def default_voice_for(provider: str) -> str:
+    """The fallback voice for a provider when the stored one isn't in-catalog."""
+    return DEFAULT_VOICE_BY_PROVIDER.get(provider, DEFAULT_VOICE_ID)

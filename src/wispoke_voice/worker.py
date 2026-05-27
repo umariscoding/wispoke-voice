@@ -43,7 +43,6 @@ from wispoke_voice.agent import BookingAgent, BookingState
 from wispoke_voice.api_client import WispokeApiClient
 from wispoke_voice.config import get_settings
 from wispoke_voice.observability import LatencyTimer, get_logger, setup_logging
-from wispoke_voice.prompts import GREETING_FALLBACKS
 from wispoke_voice.providers import make_llm, make_stt, make_tts
 from wispoke_voice.tenant import load_tenant_config
 
@@ -149,16 +148,12 @@ async def _run_session(ctx: JobContext) -> None:
     session: Optional[AgentSession] = None
 
     try:
-        # Connect to the room FIRST so LiveKit sees the participant join.
-        # Without this the framework warns "job task completed without
-        # establishing a connection" — even if session.start would do it
-        # implicitly, doing it eagerly tightens the dispatch ack and gives
-        # us a clean place to fail loudly if room setup itself is broken.
-        await ctx.connect()
+        # Load tenant config + open the call log BEFORE connecting media.
+        # Neither needs the room, and we need the tenant to build the agent.
+        with timer.span("api.load_tenant_config"):
+            tenant = await load_tenant_config(api, company_id)
 
-        # Open the call log second. Non-fatal: if the API is down we still
-        # let the session run so the caller hears the agent — they just
-        # won't get a transcript row.
+        # Open the call log (best-effort — a down API must not block the call).
         try:
             with timer.span("api.open_call_log"):
                 call_log_id = await api.open_call_log(
@@ -173,13 +168,9 @@ async def _run_session(ctx: JobContext) -> None:
                 extra={"wispoke_api_url": _cfg.wispoke_api_url},
             )
 
-        with timer.span("api.load_tenant_config"):
-            tenant = await load_tenant_config(api, company_id)
-
         # The `is_enabled` toggle only gates production traffic (SIP/phone).
-        # Browser test calls from the dashboard are the *means* of validating
-        # the agent before enabling it for real callers, so we let them through
-        # regardless of the toggle. SIP callers (Phase 2) will respect the flag.
+        # Browser test calls are the means of validating the agent before
+        # enabling it, so we let them through regardless of the toggle.
         if not tenant.is_enabled and source != "browser":
             logger.warning(
                 "tenant has voice agent disabled — declining session",
@@ -187,8 +178,7 @@ async def _run_session(ctx: JobContext) -> None:
             )
             return
 
-        # Override tenant language with the per-session language if the FE
-        # specified one (e.g. dashboard language toggle).
+        # Override tenant language with the per-session language if specified.
         if language in ("en", "da") and language != tenant.language:
             tenant = type(tenant)(  # frozen dataclass — clone with override
                 **{**tenant.__dict__, "language": language}
@@ -196,9 +186,8 @@ async def _run_session(ctx: JobContext) -> None:
 
         agent = BookingAgent(tenant=tenant, api_client=api, timer=timer)
 
-        # VAD is the heaviest plugin to initialize (~700ms cold). Reuse the
-        # prewarmed instance from `setup_fnc` if available; only load on demand
-        # if we're running unprewarmed (CI, simulate_job, etc).
+        # Reuse the prewarmed VAD from setup_fnc; only load on demand if we're
+        # running unprewarmed (CI / simulate_job).
         vad = ctx.proc.userdata.get("vad") if hasattr(ctx, "proc") else None
         if vad is None:
             vad = silero.VAD.load()
@@ -213,32 +202,22 @@ async def _run_session(ctx: JobContext) -> None:
             ),
         )
 
+        # Canonical LiveKit pattern: `session.start(agent, room)` connects the
+        # room, wires RoomIO, and fires the agent's `on_enter()` (which speaks
+        # the greeting). We do NOT manually ctx.connect() / wait_for_participant
+        # / block on a greeting say() — that sequence could wedge the session
+        # in a permanent "speaking" state when TTS stalled. The greeting now
+        # lives in BookingAgent.on_enter and is interruptible.
         await session.start(room=ctx.room, agent=agent)
 
-        # Wait until the participant is actually in the room before greeting.
-        # Without this the greeting can fire while the WebRTC peer is still
-        # negotiating — the audio reaches an empty subscription and the caller
-        # hears nothing.
-        try:
-            await ctx.wait_for_participant()
-        except Exception:
-            logger.exception("wait_for_participant failed; proceeding to greet anyway")
-
-        # Greet with `session.say()` (NOT generate_reply). `say` speaks the
-        # exact text we hand it, skips the LLM round-trip, and is non-
-        # interruptible — so the caller hears the full greeting even if they
-        # start talking immediately.
-        greeting = tenant.greeting_message or GREETING_FALLBACKS.get(tenant.language, GREETING_FALLBACKS["en"])
-        with timer.span("greeting"):
-            await session.say(greeting, allow_interruptions=False)
-
-        # Hold the coroutine open until the room closes; the LiveKit runtime
-        # cancels this task automatically when the participant disconnects.
+        # Hold the entrypoint open until the participant disconnects — the
+        # runtime cancels this task on room close, which routes us to the
+        # flush in `finally`.
         await asyncio.Future()
 
     except asyncio.CancelledError:
-        # Normal shutdown path (participant disconnected). Let it propagate
-        # after we flush in the finally block.
+        # Normal shutdown path (participant disconnected). Re-raise after the
+        # finally block flushes the call log.
         raise
     except Exception:
         logger.exception(
