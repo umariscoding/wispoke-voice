@@ -1,0 +1,11 @@
+# Keep the build context lean + never ship secrets/local artifacts.
+.venv/
+.env
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+tests/
+*.egg-info/
+.git/
+.python-version
