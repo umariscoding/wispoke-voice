@@ -57,6 +57,24 @@ class Settings(BaseSettings):
             )
         return v
 
+    @field_validator("wispoke_api_url")
+    @classmethod
+    def _normalize_api_url(cls, v: str) -> str:
+        """Guarantee a scheme + no trailing slash.
+
+        httpx's AsyncClient(base_url=...) silently fails to route a schemeless
+        host like `api.wispoke.com` ("Request URL is missing a protocol"), so
+        every /voice/internal/* call would crash the session. Deploys commonly
+        set the env var without `https://`, so we self-heal here rather than
+        depend on it being set perfectly.
+        """
+        v = (v or "").strip().rstrip("/")
+        if not v:
+            return "http://localhost:8081"
+        if not v.startswith(("http://", "https://")):
+            v = f"https://{v}"
+        return v
+
 
 @lru_cache
 def get_settings() -> Settings:
