@@ -35,7 +35,7 @@ from datetime import datetime, timezone  # noqa: E402
 from typing import Any, Dict, List, Optional  # noqa: E402
 
 from livekit import agents  # noqa: E402
-from livekit.agents import AgentServer, AgentSession, JobContext, TurnHandlingOptions  # noqa: E402
+from livekit.agents import AgentServer, AgentSession, JobContext, JobProcess, TurnHandlingOptions  # noqa: E402
 from livekit.plugins import silero  # noqa: E402
 from livekit.plugins.turn_detector.multilingual import MultilingualModel  # noqa: E402
 
@@ -196,11 +196,18 @@ async def _run_session(ctx: JobContext) -> None:
 
         agent = BookingAgent(tenant=tenant, api_client=api, timer=timer)
 
+        # VAD is the heaviest plugin to initialize (~700ms cold). Reuse the
+        # prewarmed instance from `setup_fnc` if available; only load on demand
+        # if we're running unprewarmed (CI, simulate_job, etc).
+        vad = ctx.proc.userdata.get("vad") if hasattr(ctx, "proc") else None
+        if vad is None:
+            vad = silero.VAD.load()
+
         session = AgentSession(
             stt=make_stt(tenant),
             llm=make_llm(tenant),
             tts=make_tts(tenant),
-            vad=silero.VAD.load(),
+            vad=vad,
             turn_handling=TurnHandlingOptions(
                 turn_detection=MultilingualModel(),
             ),
@@ -208,10 +215,22 @@ async def _run_session(ctx: JobContext) -> None:
 
         await session.start(room=ctx.room, agent=agent)
 
-        # Greet first so the caller hears the agent immediately.
+        # Wait until the participant is actually in the room before greeting.
+        # Without this the greeting can fire while the WebRTC peer is still
+        # negotiating — the audio reaches an empty subscription and the caller
+        # hears nothing.
+        try:
+            await ctx.wait_for_participant()
+        except Exception:
+            logger.exception("wait_for_participant failed; proceeding to greet anyway")
+
+        # Greet with `session.say()` (NOT generate_reply). `say` speaks the
+        # exact text we hand it, skips the LLM round-trip, and is non-
+        # interruptible — so the caller hears the full greeting even if they
+        # start talking immediately.
         greeting = tenant.greeting_message or GREETING_FALLBACKS.get(tenant.language, GREETING_FALLBACKS["en"])
         with timer.span("greeting"):
-            await session.generate_reply(instructions=f"Greet the caller exactly with: {greeting}")
+            await session.say(greeting, allow_interruptions=False)
 
         # Hold the coroutine open until the room closes; the LiveKit runtime
         # cancels this task automatically when the participant disconnects.
@@ -258,7 +277,26 @@ async def _run_session(ctx: JobContext) -> None:
 _settings = get_settings()
 setup_logging(_settings.log_level)
 
-server = AgentServer()
+
+def _prewarm(proc: JobProcess) -> None:
+    """Load heavy models at process startup instead of per-call.
+
+    Silero VAD takes ~700ms to load and pegs the CPU below realtime if loaded
+    lazily on the hot path (you'd see `inference is slower than realtime` in
+    the logs). Loading it here, in the warm subprocess, means the very first
+    user utterance lands on an already-spun-up model.
+
+    Cache the instance on `proc.userdata` — every job dispatched to this
+    subprocess reuses the same VAD without paying the load cost again.
+    """
+    proc.userdata["vad"] = silero.VAD.load()
+
+
+# `num_idle_processes=1` keeps one warm worker subprocess sitting ready so the
+# first call after worker boot doesn't pay the ~1s subprocess-spawn cost. We
+# default to 1 in dev (cheap; you're only testing one call at a time) — bump
+# this in production to match expected concurrency.
+server = AgentServer(setup_fnc=_prewarm, num_idle_processes=1)
 
 
 @server.rtc_session(agent_name=_settings.agent_name)

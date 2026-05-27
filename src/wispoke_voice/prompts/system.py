@@ -14,7 +14,9 @@ three layers that prevent hallucinated bookings.
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Literal
+from zoneinfo import ZoneInfo
 
 from wispoke_voice.tenant.models import TenantConfig
 
@@ -59,9 +61,24 @@ bookingen. Hvis de vil tale med en person, kald `request_human_handoff`.
 """
 
 
+def _today_in_tenant_tz(tenant: TenantConfig) -> str:
+    """Today's date in YYYY-MM-DD in the tenant's local timezone.
+
+    The LLM has no inherent notion of "today" — its training cutoff means it
+    will happily pick a date from 2023 if not told otherwise. Injecting the
+    current date here is the single fix that prevents stale-year hallucinations.
+    """
+    try:
+        tz = ZoneInfo(tenant.timezone)
+    except Exception:
+        tz = ZoneInfo("UTC")
+    return datetime.now(tz).strftime("%Y-%m-%d")
+
+
 def build_system_prompt(tenant: TenantConfig) -> str:
     """Compose the final system prompt from base rules + tenant context."""
     rules = _BASE_RULES_DA if tenant.language == "da" else _BASE_RULES_EN
+    today = _today_in_tenant_tz(tenant)
 
     if tenant.language == "da":
         identity = (
@@ -69,8 +86,10 @@ def build_system_prompt(tenant: TenantConfig) -> str:
             + (f" — en {tenant.business_type}." if tenant.business_type else ".")
         )
         booking_ctx = (
-            f"Standardvarigheden for en aftale er {tenant.appointment_duration_min} minutter. "
-            f"Tenantens tidszone er {tenant.timezone}."
+            f"I dag er {today} (tenantens tidszone: {tenant.timezone}). "
+            f"Når kunden siger 'i morgen', 'næste tirsdag' osv., omsæt det "
+            f"til en ISO-dato (YYYY-MM-DD) ud fra denne dato. "
+            f"Standardvarigheden for en aftale er {tenant.appointment_duration_min} minutter."
         )
     else:
         identity = (
@@ -78,8 +97,11 @@ def build_system_prompt(tenant: TenantConfig) -> str:
             + (f" — a {tenant.business_type}." if tenant.business_type else ".")
         )
         booking_ctx = (
-            f"Default appointment length is {tenant.appointment_duration_min} minutes. "
-            f"Tenant timezone is {tenant.timezone}."
+            f"Today is {today} (tenant timezone: {tenant.timezone}). "
+            f"When the caller says 'tomorrow', 'next Tuesday', etc., convert "
+            f"it to an ISO date (YYYY-MM-DD) relative to today. NEVER use a "
+            f"date from your training data — always compute from today. "
+            f"Default appointment length is {tenant.appointment_duration_min} minutes."
         )
 
     parts = [identity, booking_ctx, rules]
