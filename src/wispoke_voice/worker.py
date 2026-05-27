@@ -41,7 +41,6 @@ from livekit.plugins.turn_detector.multilingual import MultilingualModel  # noqa
 
 from wispoke_voice.agent import BookingAgent, BookingState
 from wispoke_voice.api_client import WispokeApiClient
-from wispoke_voice.config import get_settings
 from wispoke_voice.observability import LatencyTimer, get_logger, setup_logging
 from wispoke_voice.providers import make_llm, make_stt, make_tts
 from wispoke_voice.tenant import load_tenant_config
@@ -253,8 +252,16 @@ async def _run_session(ctx: JobContext) -> None:
 # ─── AgentServer bootstrap ─────────────────────────────────────────────────
 
 
-_settings = get_settings()
-setup_logging(_settings.log_level)
+# Agent name the worker registers under. A module-level constant (NOT read
+# from Settings) so importing this module — e.g. `python -m wispoke_voice.worker
+# download-files` during the Docker build, before any env vars exist — never
+# triggers settings validation. Real config is validated lazily, per session,
+# inside `_run_session` (`get_settings()`), by which point env vars are present.
+#
+# DO NOT reintroduce `_settings = get_settings()` at module scope: it makes the
+# build's `download-files` step crash with "Field required" for the unset
+# LIVEKIT_*/secret env vars.
+AGENT_NAME = "wispoke-booking-agent"
 
 
 def _prewarm(proc: JobProcess) -> None:
@@ -278,13 +285,18 @@ def _prewarm(proc: JobProcess) -> None:
 server = AgentServer(setup_fnc=_prewarm, num_idle_processes=1)
 
 
-@server.rtc_session(agent_name=_settings.agent_name)
+@server.rtc_session(agent_name=AGENT_NAME)
 async def entrypoint(ctx: JobContext) -> None:
     await _run_session(ctx)
 
 
 def main() -> None:
-    """CLI entry — picks up `dev` / `start` / `download-files` from argv."""
+    """CLI entry — picks up `dev` / `start` / `download-files` from argv.
+
+    Logging is configured from LOG_LEVEL directly (not the validated Settings)
+    so `download-files` works at build time without the full env.
+    """
+    setup_logging(os.environ.get("LOG_LEVEL", "INFO"))
     agents.cli.run_app(server)
 
 
