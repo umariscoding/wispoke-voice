@@ -83,6 +83,18 @@ class WispokeApiClient:
     async def get_tenant_config(self, company_id: str) -> Dict[str, Any]:
         return await self._request("GET", f"/voice/internal/tenant/{company_id}")
 
+    # ─── SIP inbound — resolve dialed number → tenant ──────────────────────
+
+    async def resolve_sip_tenant(self, e164: str) -> Dict[str, Any]:
+        """Used on SIP inbound when the worker doesn't yet know the tenant.
+
+        Mint the token with `company_id=None` (the route doesn't require a
+        scoped token — see voice_internal/auth.py).
+        """
+        return await self._request(
+            "GET", "/voice/internal/sip/resolve", params={"to": e164}
+        )
+
     # ─── Availability ──────────────────────────────────────────────────────
 
     async def get_available_slots(

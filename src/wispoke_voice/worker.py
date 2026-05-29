@@ -108,6 +108,36 @@ async def _run_session(ctx: JobContext) -> None:
 
     meta = _parse_job_metadata(ctx.job.metadata)
     company_id = meta.get("company_id")
+    # SIP inbound path: LiveKit dispatches with the dialed number but no
+    # company_id (the trunk doesn't know which tenant owns the DID). Resolve
+    # via wispoke-api before failing.
+    called_number = meta.get("called_number") or meta.get("to")
+    if not company_id and called_number:
+        try:
+            _resolver = WispokeApiClient(company_id=None)
+            try:
+                resolved = await _resolver.resolve_sip_tenant(called_number)
+            finally:
+                await _resolver.aclose()
+            company_id = resolved.get("company_id")
+            # If the dispatch didn't set a language, take the tenant's default.
+            if "language" not in meta and resolved.get("language"):
+                meta["language"] = resolved["language"]
+            # SIP-resolved jobs are phone calls by definition; pin the source
+            # so the call_log row is attributed correctly even if the dispatch
+            # rule template didn't set it.
+            meta.setdefault("source", "phone")
+            logger.info(
+                "SIP tenant resolved",
+                extra={"called_number": called_number, "company_id": company_id},
+            )
+        except Exception:
+            logger.exception(
+                "SIP tenant resolution failed — declining call",
+                extra={"called_number": called_number, "room": ctx.room.name},
+            )
+            return
+
     if not company_id:
         # Without a tenant we can't safely run — bail before any setup.
         logger.error(
