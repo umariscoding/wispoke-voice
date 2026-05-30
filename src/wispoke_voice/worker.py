@@ -108,11 +108,42 @@ async def _run_session(ctx: JobContext) -> None:
 
     meta = _parse_job_metadata(ctx.job.metadata)
     company_id = meta.get("company_id")
-    # SIP inbound path: LiveKit dispatches with the dialed number but no
-    # company_id (the trunk doesn't know which tenant owns the DID). Resolve
-    # via wispoke-api before failing.
-    called_number = meta.get("called_number") or meta.get("to")
-    if not company_id and called_number:
+
+    # SIP inbound path: company_id isn't in metadata (one dispatch rule serves
+    # every tenant — the per-tenant routing is by dialed number). LiveKit's
+    # `{{call.to}}` template doesn't substitute reliably in dispatch metadata,
+    # so we read the dialed number from the SIP participant's attributes
+    # *after* they join. The participant's `sip.phoneNumber` is set by LiveKit
+    # itself, so it's the source of truth.
+    if not company_id:
+        try:
+            await ctx.connect()
+            sip_participant = await asyncio.wait_for(
+                ctx.wait_for_participant(), timeout=30.0
+            )
+        except asyncio.TimeoutError:
+            logger.error(
+                "no participant joined within 30s — declining job",
+                extra={"room": ctx.room.name},
+            )
+            return
+
+        attrs = dict(sip_participant.attributes or {})
+        # LiveKit Cloud SIP exposes the dialed number under `sip.phoneNumber`;
+        # check a couple of historical alternates so we're resilient to SDK
+        # versions and to bring-your-own-trunk setups.
+        called_number = (
+            attrs.get("sip.phoneNumber")
+            or attrs.get("sip.trunkPhoneNumber")
+            or attrs.get("sip.to")
+        )
+        if not called_number:
+            logger.error(
+                "SIP participant has no dialed-number attribute — declining",
+                extra={"room": ctx.room.name, "attributes": list(attrs.keys())},
+            )
+            return
+
         try:
             _resolver = WispokeApiClient(company_id=None)
             try:
@@ -120,12 +151,8 @@ async def _run_session(ctx: JobContext) -> None:
             finally:
                 await _resolver.aclose()
             company_id = resolved.get("company_id")
-            # If the dispatch didn't set a language, take the tenant's default.
             if "language" not in meta and resolved.get("language"):
                 meta["language"] = resolved["language"]
-            # SIP-resolved jobs are phone calls by definition; pin the source
-            # so the call_log row is attributed correctly even if the dispatch
-            # rule template didn't set it.
             meta.setdefault("source", "phone")
             logger.info(
                 "SIP tenant resolved",
@@ -139,7 +166,9 @@ async def _run_session(ctx: JobContext) -> None:
             return
 
     if not company_id:
-        # Without a tenant we can't safely run — bail before any setup.
+        # Browser dispatched with no company_id in metadata — a real bug
+        # somewhere upstream (token mint, dashboard) since the SIP path above
+        # would have either resolved or returned.
         logger.error(
             "job dispatched with no company_id in metadata",
             extra={"room": ctx.room.name, "metadata": meta},
