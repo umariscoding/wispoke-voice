@@ -129,12 +129,18 @@ async def _run_session(ctx: JobContext) -> None:
             return
 
         attrs = dict(sip_participant.attributes or {})
-        # LiveKit Cloud SIP exposes the dialed number under `sip.phoneNumber`;
-        # check a couple of historical alternates so we're resilient to SDK
-        # versions and to bring-your-own-trunk setups.
+        # `sip.trunkPhoneNumber` is the number the call came in TO (the
+        # tenant-owned DID we look up). `sip.phoneNumber` is the *other*
+        # party — for inbound that's the CALLER, not the dialed number, so
+        # we must not fall back to it for tenant resolution. Log all attrs
+        # at debug-level so future SDK shape changes are easy to diagnose.
+        logger.info(
+            "SIP participant attributes",
+            extra={"room": ctx.room.name, "attributes": attrs},
+        )
         called_number = (
-            attrs.get("sip.phoneNumber")
-            or attrs.get("sip.trunkPhoneNumber")
+            attrs.get("sip.trunkPhoneNumber")
+            or attrs.get("sip.calledNumber")
             or attrs.get("sip.to")
         )
         if not called_number:
