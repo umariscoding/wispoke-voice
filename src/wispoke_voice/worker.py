@@ -149,6 +149,12 @@ async def _run_session(ctx: JobContext) -> None:
                 extra={"room": ctx.room.name, "attributes": list(attrs.keys())},
             )
             return
+        # LiveKit Cloud strips the leading "+" from `sip.trunkPhoneNumber`
+        # ("12139433359" instead of "+12139433359"). Our `/sip/resolve`
+        # endpoint requires E.164 with the "+", and the `phone_numbers` table
+        # stores it that way. Re-add it if missing so the lookup hits.
+        if not called_number.startswith("+"):
+            called_number = "+" + called_number.lstrip()
 
         try:
             _resolver = WispokeApiClient(company_id=None)
