@@ -146,6 +146,8 @@ class WispokeApiClient:
         appointment_id: Optional[str] = None,
         latency_metrics: Optional[Dict[str, Any]] = None,
         started_at_iso: Optional[str] = None,
+        recording_url: Optional[str] = None,
+        recording_format: Optional[str] = None,
     ) -> None:
         body = {
             "transcript": transcript,
@@ -153,6 +155,8 @@ class WispokeApiClient:
             "appointment_id": appointment_id,
             "latency_metrics": latency_metrics,
             "started_at": started_at_iso,
+            "recording_url": recording_url,
+            "recording_format": recording_format,
         }
         body = {k: v for k, v in body.items() if v is not None}
         await self._request("PATCH", f"/voice/internal/call-logs/{call_log_id}", json=body)
