@@ -32,7 +32,7 @@ load_dotenv(_DOTENV_PATH, override=False)
 import asyncio  # noqa: E402
 import json  # noqa: E402
 from datetime import datetime, timezone  # noqa: E402
-from typing import Any, Dict, List, Optional  # noqa: E402
+from typing import Any, Dict, Optional  # noqa: E402
 
 from livekit import agents  # noqa: E402
 from livekit.agents import AgentServer, AgentSession, JobContext, JobProcess, TurnHandlingOptions  # noqa: E402
@@ -43,7 +43,9 @@ from wispoke_voice.agent import BookingAgent, BookingState
 from wispoke_voice.api_client import WispokeApiClient
 from wispoke_voice.observability import LatencyTimer, get_logger, setup_logging
 from wispoke_voice.providers import make_llm, make_stt, make_tts
+from wispoke_voice.recording import RECORDING_FORMAT, recording_key, start_recording, stop_recording
 from wispoke_voice.tenant import load_tenant_config
+from wispoke_voice.transcript import TranscriptCollector
 
 
 logger = get_logger("wispoke.voice.worker")
@@ -74,40 +76,14 @@ def _classify_outcome(agent: BookingAgent) -> str:
     return "aborted"
 
 
-def _collect_transcript(session: AgentSession) -> List[Dict[str, Any]]:
-    """Best-effort transcript extraction.
-
-    LiveKit exposes the conversation through `session.history` (or a similar
-    field depending on SDK version). We gracefully degrade: if the field
-    isn't present, we return an empty list rather than crashing the flush.
-    """
-    history = getattr(session, "history", None)
-    if not history:
-        return []
-    items = getattr(history, "items", history)
-    out: List[Dict[str, Any]] = []
-    for item in items or []:
-        # Try a few attribute shapes used across LiveKit SDK versions.
-        role = getattr(item, "role", None) or (item.get("role") if isinstance(item, dict) else None)
-        content = (
-            getattr(item, "content", None)
-            or getattr(item, "text", None)
-            or (item.get("content") if isinstance(item, dict) else None)
-        )
-        if role is None and content is None:
-            continue
-        # Flatten content blocks to a single string for the call log.
-        if isinstance(content, list):
-            content = " ".join(str(c) for c in content)
-        out.append({"role": str(role) if role else "system", "content": str(content or "")})
-    return out
-
-
 async def _run_session(ctx: JobContext) -> None:
     """One LiveKit job = one tenant voice session."""
 
     meta = _parse_job_metadata(ctx.job.metadata)
     company_id = meta.get("company_id")
+    # Caller's phone number (inbound SIP only) — surfaced in the dashboard as
+    # the call's identity. Browser test calls leave this None.
+    caller_ref: Optional[str] = None
 
     # SIP inbound path: company_id isn't in metadata (one dispatch rule serves
     # every tenant — the per-tenant routing is by dialed number). LiveKit's
@@ -143,6 +119,10 @@ async def _run_session(ctx: JobContext) -> None:
             or attrs.get("sip.calledNumber")
             or attrs.get("sip.to")
         )
+        # `sip.phoneNumber` is the OTHER party — for inbound, the caller. We
+        # don't use it for tenant resolution (that's the dialed number above),
+        # but it's exactly what we want to label the call in the dashboard.
+        caller_ref = attrs.get("sip.phoneNumber") or attrs.get("sip.from")
         if not called_number:
             logger.error(
                 "SIP participant has no dialed-number attribute — declining",
@@ -216,6 +196,11 @@ async def _run_session(ctx: JobContext) -> None:
     # exception path sees `None` rather than UnboundLocalError if we crash
     # before assignment.
     session: Optional[AgentSession] = None
+    # Transcript is collected live (via session events), so even a session that
+    # crashes mid-call flushes whatever was said up to that point.
+    transcript_collector = TranscriptCollector()
+    egress_id: Optional[str] = None
+    crashed = False
 
     try:
         # Load tenant config + open the call log BEFORE connecting media.
@@ -231,6 +216,7 @@ async def _run_session(ctx: JobContext) -> None:
                     room_name=ctx.room.name,
                     language=language,
                     source=source,
+                    caller_ref=caller_ref,
                 )
         except Exception:
             logger.exception(
@@ -272,6 +258,10 @@ async def _run_session(ctx: JobContext) -> None:
             ),
         )
 
+        # Attach the transcript collector BEFORE start so the agent's greeting
+        # (spoken in on_enter) lands in the transcript with a timestamp.
+        transcript_collector.attach(session)
+
         # Canonical LiveKit pattern: `session.start(agent, room)` connects the
         # room, wires RoomIO, and fires the agent's `on_enter()` (which speaks
         # the greeting). We do NOT manually ctx.connect() / wait_for_participant
@@ -280,39 +270,75 @@ async def _run_session(ctx: JobContext) -> None:
         # lives in BookingAgent.on_enter and is interruptible.
         await session.start(room=ctx.room, agent=agent)
 
-        # Hold the entrypoint open until the participant disconnects — the
-        # runtime cancels this task on room close, which routes us to the
-        # flush in `finally`.
-        await asyncio.Future()
+        # Start recording once the room has media flowing. Best-effort: a failed
+        # or unconfigured egress returns None and the call proceeds unrecorded.
+        # We use the call_log_id in the object key so the recording and its log
+        # row line up; skip if the log couldn't be opened.
+        if call_log_id:
+            egress_id = await start_recording(ctx.room.name, company_id, call_log_id)
+
+        # End the session the instant the caller leaves. The agent is the local
+        # participant and stays connected after a hangup, so the room never goes
+        # "empty" on its own — relying on room-close to tear us down would let
+        # the egress keep recording silence until an idle timeout fired. Instead
+        # we watch for the remote (caller) disconnecting and stop immediately.
+        call_ended = asyncio.Event()
+        loop = asyncio.get_running_loop()
+
+        @ctx.room.on("participant_disconnected")
+        def _on_participant_left(participant: Any) -> None:  # rtc.RemoteParticipant
+            # Only remote participants fire this (the agent is local), so any
+            # disconnect here is the caller hanging up.
+            logger.info(
+                "caller disconnected — ending call + recording",
+                extra={"room": ctx.room.name, "identity": getattr(participant, "identity", None)},
+            )
+            loop.call_soon_threadsafe(call_ended.set)
+
+        @ctx.room.on("disconnected")
+        def _on_room_disconnected(*_: Any) -> None:
+            # Agent's own connection dropped / room closed — also end here.
+            loop.call_soon_threadsafe(call_ended.set)
+
+        # Wake the instant the caller leaves and fall straight into `finally`,
+        # which stops egress before anything else. (CancelledError on a forced
+        # job shutdown still routes through `finally` too.)
+        await call_ended.wait()
 
     except asyncio.CancelledError:
-        # Normal shutdown path (participant disconnected). Re-raise after the
-        # finally block flushes the call log.
+        # Forced shutdown (worker draining / job killed). The normal hangup path
+        # returns via `call_ended` above; this is the fallback. Re-raise after
+        # the finally block stops egress + flushes the call log.
         raise
     except Exception:
+        crashed = True
         logger.exception(
             "voice session crashed",
             extra={"company_id": company_id, "call_log_id": call_log_id},
         )
     finally:
+        # Stop egress first so the recording finalizes in storage before we
+        # write its key to the call log. Best-effort — also auto-stops on room
+        # close. We only ran egress if call_log_id existed, so the key matches.
+        await stop_recording(egress_id)
+
         # Flush the call log regardless of how we got here. We always want a
         # row in the dashboard so the user can see what happened.
         if call_log_id:
             try:
-                outcome = _classify_outcome(agent) if agent else "aborted"
-                transcript: List[Dict[str, Any]] = []
-                try:
-                    # `session` may not exist if we crashed before its assignment.
-                    transcript = _collect_transcript(session)  # type: ignore[name-defined]
-                except NameError:
-                    pass
+                # A crash gets the dedicated 'failed' outcome; otherwise classify
+                # from the agent's terminal booking state.
+                outcome = "failed" if crashed else (_classify_outcome(agent) if agent else "aborted")
+                recording_url = recording_key(company_id, call_log_id) if egress_id else None
                 await api.finalize_call_log(
                     call_log_id,
-                    transcript=transcript,
+                    transcript=transcript_collector.entries(),
                     outcome=outcome,
                     appointment_id=(agent.draft.booking_id if agent else None),
                     latency_metrics=timer.snapshot(),
                     started_at_iso=started_at.isoformat(),
+                    recording_url=recording_url,
+                    recording_format=RECORDING_FORMAT if egress_id else None,
                 )
             except Exception:
                 logger.exception("call log flush failed", extra={"call_log_id": call_log_id})

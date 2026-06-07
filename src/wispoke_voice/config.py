@@ -34,6 +34,19 @@ class Settings(BaseSettings):
     openai_api_key: Optional[str] = None
     anthropic_api_key: Optional[str] = None
 
+    # --- Call recording (LiveKit Egress → Supabase Storage, S3-compatible) ---
+    # Recording is best-effort and self-gating: if the S3 creds below aren't
+    # set, the worker simply skips egress (calls still work, just no audio).
+    recording_enabled: bool = True
+    recording_bucket: str = "call-recordings"
+    # Supabase Storage exposes an S3-compatible endpoint:
+    #   https://<project-ref>.supabase.co/storage/v1/s3
+    # Generate the access key/secret in Supabase → Project → Storage → S3 access.
+    supabase_s3_endpoint: Optional[str] = None
+    supabase_s3_region: str = "us-east-1"
+    supabase_s3_access_key: Optional[str] = None
+    supabase_s3_secret: Optional[str] = None
+
     # --- Logging ---
     log_level: str = "INFO"
 
@@ -56,6 +69,21 @@ class Settings(BaseSettings):
                 'Generate with: python -c "import secrets; print(secrets.token_hex(32))"'
             )
         return v
+
+    @property
+    def recording_configured(self) -> bool:
+        """True only when egress has somewhere to upload to.
+
+        Used by the recording module to decide whether to start egress — keeps
+        the worker fully functional (calls + transcripts) on deploys that
+        haven't wired Supabase Storage creds yet.
+        """
+        return bool(
+            self.recording_enabled
+            and self.supabase_s3_endpoint
+            and self.supabase_s3_access_key
+            and self.supabase_s3_secret
+        )
 
     @field_validator("wispoke_api_url")
     @classmethod
