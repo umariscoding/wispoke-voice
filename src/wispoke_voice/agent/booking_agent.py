@@ -365,10 +365,11 @@ class BookingAgent(Agent):
     async def request_human_handoff(self, ctx: RunContext, reason: str) -> str:
         """Mark this call for handoff to a human agent.
 
-        Call this when the caller asks for a person, when you've failed
-        a task twice, or when something the caller asks is clearly out of
-        scope (medical advice, account changes, etc). `reason` is a short
-        free-text note that gets attached to the call log.
+        Call this ONLY when the caller explicitly asks to speak to a person,
+        or asks for something clearly out of scope (medical advice, account
+        changes, etc). Do NOT call it because the caller is rude, abrupt or
+        confused, or just said something short like "hello?" or "shut up".
+        `reason` is a short free-text note that gets attached to the call log.
         """
         self._state.transition(BookingState.HANDOFF)
         self._draft.notes = (self._draft.notes or "") + f"\n[handoff] {reason}"
