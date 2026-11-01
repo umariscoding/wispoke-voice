@@ -358,7 +358,7 @@ async def _run_session(ctx: JobContext) -> None:
 # DO NOT reintroduce `_settings = get_settings()` at module scope: it makes the
 # build's `download-files` step crash with "Field required" for the unset
 # LIVEKIT_*/secret env vars.
-AGENT_NAME = "wispoke-booking-agent"
+AGENT_NAME = os.environ.get("AGENT_NAME", "wispoke-booking-agent")
 
 
 def _prewarm(proc: JobProcess) -> None:

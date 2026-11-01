@@ -14,7 +14,7 @@ three layers that prevent hallucinated bookings.
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Iterable, Literal
 from zoneinfo import ZoneInfo
 
@@ -32,8 +32,10 @@ If asked about times before calling that tool, say you'll check and call it.
 2. ALWAYS read the slot back to the caller (using the exact words from \
 `read_back_slot`) and get a clear "yes" BEFORE calling `create_booking`. \
 "Maybe" or silence is NOT a yes.
-3. Collect required fields (name, phone) before offering slots. Spell phone \
-digits back one at a time to confirm.
+3. If the caller asks what times are available, call `get_available_slots` \
+right away — do NOT ask for their name or phone first. Collect the required \
+fields (name, phone) only once they want to book a slot, before calling \
+`propose_slot`. Spell phone digits back one at a time to confirm.
 4. If the caller asks something off-topic, briefly answer then steer back to \
 booking. If they ask for a human, call `request_human_handoff`.
 5. Speak in the caller's language. Default is the tenant default; if they \
@@ -51,8 +53,10 @@ og kald det.
 2. Læs ALTID tiden op for kunden (med ordlyden fra `read_back_slot`) og få \
 en tydelig "ja" FØR du kalder `create_booking`. "Måske" eller tavshed er IKKE \
 et ja.
-3. Indhent de påkrævede oplysninger (navn, telefon), før du tilbyder tider. \
-Stav telefonnummeret tilbage ét ciffer ad gangen.
+3. Hvis kunden spørger om ledige tider, kald `get_available_slots` med det \
+samme — spørg IKKE om navn eller telefon først. Indhent de påkrævede \
+oplysninger (navn, telefon), først når kunden vil booke en tid, før du kalder \
+`propose_slot`. Stav telefonnummeret tilbage ét ciffer ad gangen.
 4. Hvis kunden spørger om noget andet, svar kort og drej tilbage til \
 bookingen. Hvis de vil tale med en person, kald `request_human_handoff`.
 5. Tal kundens sprog. Standardsproget er tenantens; skifter de, skifter du med.
@@ -135,6 +139,14 @@ def format_business_hours(slots: Iterable[WeeklyScheduleSlot], language: Literal
     return prefix + "; ".join(parts) + closed_clause
 
 
+def _now_in_tenant_tz(tenant: TenantConfig) -> datetime:
+    try:
+        tz = ZoneInfo(tenant.timezone)
+    except Exception:
+        tz = ZoneInfo("UTC")
+    return datetime.now(tz)
+
+
 def _today_in_tenant_tz(tenant: TenantConfig) -> str:
     """Today's date in YYYY-MM-DD in the tenant's local timezone.
 
@@ -142,17 +154,32 @@ def _today_in_tenant_tz(tenant: TenantConfig) -> str:
     will happily pick a date from 2023 if not told otherwise. Injecting the
     current date here is the single fix that prevents stale-year hallucinations.
     """
-    try:
-        tz = ZoneInfo(tenant.timezone)
-    except Exception:
-        tz = ZoneInfo("UTC")
-    return datetime.now(tz).strftime("%Y-%m-%d")
+    return _now_in_tenant_tz(tenant).strftime("%Y-%m-%d")
+
+
+def _upcoming_days(tenant: TenantConfig, days: int = 8) -> str:
+    """Weekday → ISO date for today and the next week, e.g.
+    "Sunday 2026-11-01, Monday 2026-11-02, ...".
+
+    Models are unreliable at weekday arithmetic ("Monday" came back as a
+    Wednesday), so we hand them the lookup table instead of asking them to
+    compute it.
+    """
+    names = _DAY_NAMES_DA if tenant.language == "da" else _DAY_NAMES_EN
+    now = _now_in_tenant_tz(tenant)
+    out = []
+    for i in range(days):
+        d = now + timedelta(days=i)
+        # strftime("%w") is 0=Sunday, matching _DAY_NAMES_*.
+        out.append(f"{names[int(d.strftime('%w'))]} {d.strftime('%Y-%m-%d')}")
+    return ", ".join(out)
 
 
 def build_system_prompt(tenant: TenantConfig) -> str:
     """Compose the final system prompt from base rules + tenant context."""
     rules = _BASE_RULES_DA if tenant.language == "da" else _BASE_RULES_EN
     today = _today_in_tenant_tz(tenant)
+    upcoming = _upcoming_days(tenant)
     hours = format_business_hours(tenant.weekly_schedule, tenant.language)
 
     if tenant.language == "da":
@@ -162,6 +189,7 @@ def build_system_prompt(tenant: TenantConfig) -> str:
         )
         booking_ctx = (
             f"I dag er {today} (tidszone: {tenant.timezone}). "
+            f"Kommende dage: {upcoming}. "
             f"Forretningen er {hours}. "
             f"Når kunden siger 'i morgen', 'næste tirsdag' osv., omsæt det "
             f"til en ISO-dato (YYYY-MM-DD) ud fra denne dato. "
@@ -174,6 +202,7 @@ def build_system_prompt(tenant: TenantConfig) -> str:
         )
         booking_ctx = (
             f"Today is {today} (timezone: {tenant.timezone}). "
+            f"Upcoming days: {upcoming}. "
             f"The business is {hours}. "
             f"When the caller says 'tomorrow', 'next Tuesday', etc., convert "
             f"it to an ISO date (YYYY-MM-DD) relative to today. NEVER use a "
